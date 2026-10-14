@@ -99,6 +99,33 @@ def test_self_update_orders_versions():
 	assert self_update.version_of("homelab-v5.0.0-h4") == "v5.0.0-h4"
 
 
+def test_self_update_keeps_the_newest_images():
+	from homelab import self_update
+	removed = []
+
+	class Image:
+		def __init__(self, tags):
+			self.tags = tags
+
+	class Images:
+		def list(self, name):
+			return [Image([f"{name}:{v}"]) for v in ("v5.0.0-h6", "v5.0.0-h7", "v5.0.0-h8", "v5.0.0-h9",
+													"5.0.0-homelab.1", "portainer-status-updates-autoclean-4.2.0-12")]
+
+		def remove(self, ref):
+			removed.append(ref.split(":", 1)[1])
+
+	import docker
+	original, version = docker.from_env, self_update.VERSION
+	docker.from_env = lambda *a, **k: type("Client", (), {"images": Images()})()
+	self_update.VERSION = "v5.0.0-h7"   # running an older one: it is kept even if not among the newest
+	try:
+		self_update.prune_images()
+	finally:
+		docker.from_env, self_update.VERSION = original, version
+	assert sorted(removed) == ["5.0.0-homelab.1", "v5.0.0-h6"], removed
+
+
 if __name__ == "__main__":
 	failed = 0
 	for name, fn in sorted(globals().items()):

@@ -36,6 +36,7 @@ REPO = "Artifical0/docker-controller-bot"
 IMAGE = "homelab/docker-controller-bot"
 TAG = re.compile(r"^homelab-v(\d+)\.(\d+)\.(\d+)-h(\d+)$")
 CHECK_EVERY = 6 * 3600
+KEEP_IMAGES = 3   # 本机保留最近几个 homelab 版本镜像（含正在运行的），更早的在新版本上线后删除
 VERSION = os.environ.get("HOMELAB_VERSION", "")
 lock = threading.Lock()
 
@@ -196,6 +197,24 @@ def loop():
 		time.sleep(CHECK_EVERY)
 
 
+def prune_images():
+	"""每次部署都会在本机多一个镜像。只留最近 KEEP_IMAGES 个 v5 版本（一定包括正在运行的）；
+	4.2.0 时代的 homelab 镜像不归这里管，留给手工回退。早期手工构建的 5.0.0-homelab.N 一并清掉。"""
+	import docker
+	client = docker.from_env()
+	versions = [t.split(":", 1)[1] for img in client.images.list(name=IMAGE) for t in img.tags]
+	ours = [v for v in versions if order(v) > (0,)]
+	keep = set(sorted(ours, key=order)[-KEEP_IMAGES:]) | {VERSION}
+	for v in versions:
+		if v in keep or not (order(v) > (0,) or v.startswith("5.0.0-homelab.")):
+			continue
+		try:
+			client.images.remove(f"{IMAGE}:{v}")
+			logging.info("self-update: removed old image %s", v)
+		except Exception as ex:
+			logging.warning("self-update: could not remove %s: %s", v, ex)
+
+
 def report_startup():
 	"""Says how the last deploy ended, once the bot that came up can say it."""
 	time.sleep(15)
@@ -207,6 +226,10 @@ def report_startup():
 		save_state(state)
 	if VERSION == pending["to"]:
 		telegram(f"✅ 机器人已更新到 {pending['to']}（原 {pending['from']}）")
+		try:
+			prune_images()
+		except Exception as ex:
+			logging.warning("self-update: image cleanup failed: %s", ex)
 	else:
 		telegram(f"⚠️ 机器人 {pending['to']} 没有正常启动，已回滚到 {VERSION or pending['from']}")
 
