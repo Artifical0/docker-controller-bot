@@ -1,12 +1,12 @@
 """Telegram /quota：发送 account_watch.py 每 5 分钟写好的账号与额度汇总（机器人不保存任何密钥）。"""
 import json,pathlib,time,logging
-PATH=pathlib.Path('/app/schedule/account-watch/status.json')
+from homelab import paths as homelab_paths
 def install(bot,menu):
     @bot.message_handler(commands=['quota'])
     def quota(message):
         if not menu.allowed(message,message.from_user.id):return
         try:
-            data=json.loads(PATH.read_text())
+            data=json.loads(homelab_paths.data_file('account-watch/status.json').read_text())
             text=data['report']
             age=time.time()-data['generated_at']
             if age>1200:text+=f'\n\n⚠️ 数据已 {int(age//60)} 分钟没更新，巡检脚本可能没在运行。'

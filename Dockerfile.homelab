@@ -1,0 +1,46 @@
+# Homelab build: the same image as the upstream Dockerfile, but built from this
+# checkout instead of downloading the release zip, so that the homelab plugins
+# (the homelab/ package) are in it. The upstream
+# Dockerfile is left untouched so that merging a new release does not conflict.
+#
+#   docker build -f Dockerfile.homelab --build-arg VERSION=5.0.0-homelab.1 .
+ARG BASE_IMAGE=alpine:3.24.2
+FROM ${BASE_IMAGE}
+ARG BASE_IMAGE
+ARG VERSION=dev
+
+LABEL org.opencontainers.image.title="docker-controller-bot" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.source="https://github.com/Artifical0/docker-controller-bot" \
+      org.opencontainers.image.licenses="GPL-3.0" \
+      org.opencontainers.image.description="docker-controller-bot with homelab plugins (/status, /quota, Portainer update flow)" \
+      org.opencontainers.image.base.name="${BASE_IMAGE}"
+
+# TELEMETRY=0 is read by the telemetry client itself and wins over /settings.
+ENV TZ=UTC \
+    PYTHONUNBUFFERED=1 \
+    TELEMETRY=0
+
+WORKDIR /app
+
+COPY requirements.txt /app/
+RUN apk add --no-cache python3 py3-pip tzdata py3-paramiko openssh-client && \
+    PIP_BREAK_SYSTEM_PACKAGES=1 pip3 install --no-cache-dir -Ur /app/requirements.txt
+
+RUN mkdir -p /etc/ssh/ssh_config.d && \
+    printf 'Host *\n    BatchMode yes\n    ConnectTimeout 10\n    ServerAliveInterval 10\n    ServerAliveCountMax 3\n' \
+        > /etc/ssh/ssh_config.d/docker-controller-bot.conf
+
+COPY *.py /app/
+COPY locale /app/locale
+COPY homelab /app/homelab
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD python3 -c "import sys; sys.exit(0)" || exit 1
+
+ENTRYPOINT ["python3", "homelab/main.py"]
+
+ARG BUILD_DATE
+ARG VCS_REF
+LABEL org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.revision="${VCS_REF}"

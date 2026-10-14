@@ -2,9 +2,13 @@
 import copy, contextlib, fcntl, hashlib, json, os, pathlib, re, secrets, sqlite3
 import ssl, sys, threading, time, urllib.parse, urllib.request
 import requests
+if __package__ in (None, ""):
+    # Run as a script (python3 /app/homelab/docker_updates.py --scan): make the package importable.
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from homelab import paths as homelab_paths
 from datetime import datetime, timezone
 
-ROOT=pathlib.Path(os.environ.get('UPDATE_STATE_DIR','/app/schedule/image-updates'))
+ROOT=pathlib.Path(os.environ.get('UPDATE_STATE_DIR') or homelab_paths.data_file('image-updates'))
 ROOT.mkdir(mode=0o700,parents=True,exist_ok=True)
 PROTECTED={'docker-controller-bot':'定制机器人需合并代码更新','portainer':'管理入口需单独维护',
            'portainer_edge_agent':'Agent 与 Portainer 版本需配套','n8n-postgres':'数据库需单独维护'}
@@ -24,9 +28,9 @@ def db():
 
 class API:
     def __init__(self):
-        self.cfg=json.loads(pathlib.Path('/app/schedule/portainer-multihost.json').read_text())
+        self.cfg=json.loads(homelab_paths.data_file('portainer-multihost.json').read_text())
         self.envs={int(k):v for k,v in self.cfg['environments'].items()}
-        self.ctx=ssl.create_default_context(cafile=self.cfg['certificate']);self.ctx.check_hostname=False
+        self.ctx=ssl.create_default_context(cafile=homelab_paths.certificate(self.cfg['certificate']));self.ctx.check_hostname=False
     def call(self,eid,path,method='GET',data=None,raw=False,timeout=90):
         if eid not in self.envs:raise ValueError('Unknown environment')
         request=urllib.request.Request(self.cfg['url'].rstrip('/')+f'/api/endpoints/{eid}/docker'+path,

@@ -1,7 +1,7 @@
 """Forward authenticated Telegram /status commands to the n8n report workflow."""
 import json,pathlib,time,threading,urllib.request,logging
+from homelab import paths as homelab_paths
 def install(bot,menu):
-    cfg=json.loads(pathlib.Path('/app/schedule/n8n-status.json').read_text())
     lock=threading.Lock();last={};busy=set()
     @bot.message_handler(commands=['status'])
     def status(message):
@@ -12,6 +12,7 @@ def install(bot,menu):
                 menu.send(message,'正在获取或刚刚获取过状态，请稍后再试。');return
             busy.add(uid);last[uid]=time.monotonic()
         try:
+            cfg=json.loads(homelab_paths.data_file('n8n-status.json').read_text())
             req=urllib.request.Request(cfg['url'],data=b'{}',headers={'X-HomeLab-Key':cfg['token'],'Content-Type':'application/json'})
             with urllib.request.urlopen(req,timeout=95) as f:report=json.load(f)
             text=report.get('text')
