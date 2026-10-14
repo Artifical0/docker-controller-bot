@@ -4,7 +4,7 @@ Homelab plugins on top of the upstream bot.
 Run on its own (python3 tests/test_homelab.py) so that tests/run_all.py, an
 upstream file, stays untouched. It loads the bot exactly as the upstream tests
 do and checks the things a new upstream release could quietly break: that the
-plugin handlers still win over the core's catch-alls, that /status, /quota and
+plugin handlers still win over the core's catch-alls, that /status and
 the update buttons reach the plugins, that the command menu carries them, and
 that only administrators get through.
 """
@@ -53,7 +53,8 @@ def first_callback_handler(data):
 
 def test_plugin_commands_win_over_the_core():
 	assert first_message_handler(message("/status")).__module__ == "homelab.n8n_status"
-	assert first_message_handler(message("/quota")).__module__ == "homelab.quota_status"
+	# /quota moved to the separate usage bot: the core must not see it as a plugin command.
+	assert first_message_handler(message("/quota")).__module__ == "core"
 	# The core still answers its own commands and the catch-all stays last.
 	assert first_message_handler(message("/list")).__module__ == "core"
 	assert bot.message_handlers[-1]["function"].__module__ == "core"
@@ -68,7 +69,7 @@ def test_command_menu_lists_the_plugins_first():
 	import telebot
 	merged = homelab_plugins.merge_commands([telebot.types.BotCommand("/start", "x"),
 											telebot.types.BotCommand("/status", "duplicate")])
-	assert [c.command for c in merged] == ["/status", "/quota", "/start"]
+	assert [c.command for c in merged] == ["/status", "/start"]
 	assert getattr(bot.set_my_commands, "__name__", "") == "<lambda>"
 
 
@@ -79,21 +80,6 @@ def test_only_administrators_are_allowed():
 	assert not menu.allowed(message("/quota", uid=440508), 440508)
 	# An admin writing from a group that is not TELEGRAM_GROUP is ignored.
 	assert not menu.allowed(message("/quota", chat_type="group", chat_id=-100123), 4405089)
-
-
-def test_quota_reads_the_status_file_from_the_volume():
-	path = homelab_paths.data_file("account-watch/status.json")
-	path.parent.mkdir(parents=True, exist_ok=True)
-	import time
-	path.write_text(json.dumps({"generated_at": time.time(), "report": "📊 test report"}))
-	sent = []
-	original = bot.send_message
-	bot.send_message = lambda chat, text, **kw: sent.append(text)
-	try:
-		first_message_handler(message("/quota"))(message("/quota"))
-	finally:
-		bot.send_message = original
-	assert sent == ["📊 test report"], sent
 
 
 def test_certificate_falls_back_to_the_volume():

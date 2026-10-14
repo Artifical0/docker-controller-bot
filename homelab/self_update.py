@@ -224,6 +224,14 @@ def install(bot, menu):
 			if not image or not cfg:
 				bot.answer_callback_query(call.id, "这个版本已经处理过了")
 				return
+			if action == "deploy" and order(version_of(tag)) <= order(VERSION):
+				# An older offer clicked after a newer version went live would be a downgrade.
+				state["offered"].pop(tag, None)
+				save_state(state)
+				bot.answer_callback_query(call.id, "已经是更新的版本了")
+				bot.edit_message_text(f"机器人已是 {VERSION}，不再部署旧版本 {version_of(tag)}",
+									call.message.chat.id, call.message.message_id)
+				return
 			if action == "ignore":
 				state["offered"].pop(tag, None)
 				state.setdefault("ignored", []).append(tag)

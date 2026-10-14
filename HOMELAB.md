@@ -5,10 +5,9 @@
 | 文件 | 作用 |
 | :--- | :--- |
 | `homelab/main.py` | 镜像入口：把上游的 `docker-controller-bot.py` 当模块加载（命令和回调就注册好了），再装插件、启动 |
-| `homelab/plugins.py` | 把插件装到上游的 bot 上，并挪到上游兜底处理函数的前面；命令菜单里加 `/status`、`/quota` |
+| `homelab/plugins.py` | 把插件装到上游的 bot 上，并挪到上游兜底处理函数的前面；命令菜单里加 `/status` |
 | `homelab/docker_updates.py` | 经 Portainer 查新、按钮确认后更新容器，保留回退容器 2 天，清理构建缓存（每天 03:30 由外部触发 `--scan`） |
 | `homelab/n8n_status.py` | `/status`：转发给 n8n 的主机状态报告 |
-| `homelab/quota_status.py` | `/quota`：发送外部巡检脚本写好的账号与额度汇总 |
 | `homelab/self_update.py` | 机器人自己的更新（见下） |
 | `homelab/paths.py` | 插件文件放在 bot 的数据卷里（5.x 是 `/app/config`） |
 | `Dockerfile.homelab` | 用本地源码构建（上游 Dockerfile 是下载发布包）；`TELEMETRY=0`；可选 `APK_MIRROR` / `PIP_INDEX_URL` |

@@ -20,7 +20,7 @@ spec = importlib.util.spec_from_file_location("upstream_entry", os.path.join(APP
 spec.loader.exec_module(importlib.util.module_from_spec(spec))
 
 import core  # noqa: E402
-from homelab import plugins  # noqa: E402,F401  (/status, /quota and the Portainer update flow)
+from homelab import plugins  # noqa: E402,F401  (/status, the Portainer update flow and self-update)
 
 if __name__ == "__main__":
 	core.main()

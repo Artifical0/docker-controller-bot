@@ -1,4 +1,4 @@
-"""Homelab plugins: /status, /quota, the Portainer update flow and the bot's own updates.
+"""Homelab plugins: /status, the Portainer update flow and the bot's own updates.
 
 Imported by homelab/main.py once the upstream modules have registered their
 commands and callbacks. The core registers a catch-all message handler and a
@@ -10,11 +10,10 @@ import telebot
 
 import core
 from logger import error
-from homelab import docker_updates, n8n_status, quota_status, self_update
+from homelab import docker_updates, n8n_status, self_update
 
 COMMANDS = [
 	telebot.types.BotCommand("/status", "查询 Home Lab 三台主机实时状态"),
-	telebot.types.BotCommand("/quota", "账号状态与额度（CLIProxyAPI / WorkBuddy / YYB）"),
 ]
 
 
@@ -45,7 +44,7 @@ def _to_front(handlers, count):
 def install(bot):
 	before = len(bot.message_handlers), len(bot.callback_query_handlers)
 	menu = Menu(bot)
-	for plugin in (docker_updates, n8n_status, quota_status, self_update):
+	for plugin in (docker_updates, n8n_status, self_update):
 		# A broken plugin must not take the bot down with it.
 		try:
 			plugin.install(bot, menu)
