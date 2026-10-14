@@ -110,9 +110,11 @@ def current_image(cfg):
 # ---------- GitHub and building ----------
 
 def newest_tag():
-	r = requests.get(f"https://api.github.com/repos/{REPO}/tags?per_page=100", timeout=30)
+	# Only the homelab tags: the fork also carries every upstream tag, more than one page of /tags.
+	r = requests.get(f"https://api.github.com/repos/{REPO}/git/matching-refs/tags/homelab-", timeout=30)
 	r.raise_for_status()
-	tags = [t["name"] for t in r.json() if TAG.match(t["name"])]
+	tags = [ref["ref"][len("refs/tags/"):] for ref in r.json()]
+	tags = [t for t in tags if TAG.match(t)]
 	return max(tags, key=lambda t: order(version_of(t)), default=None)
 
 
