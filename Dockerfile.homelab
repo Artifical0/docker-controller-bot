@@ -23,8 +23,11 @@ ENV TZ=UTC \
 
 WORKDIR /app
 
+# Optional Alpine mirror for slow links, e.g. --build-arg APK_MIRROR=mirrors.aliyun.com
+ARG APK_MIRROR=""
 COPY requirements.txt /app/
-RUN apk add --no-cache python3 py3-pip tzdata py3-paramiko openssh-client && \
+RUN if [ -n "$APK_MIRROR" ]; then sed -i "s#dl-cdn.alpinelinux.org#$APK_MIRROR#g" /etc/apk/repositories; fi && \
+    apk add --no-cache python3 py3-pip tzdata py3-paramiko openssh-client && \
     PIP_BREAK_SYSTEM_PACKAGES=1 pip3 install --no-cache-dir -Ur /app/requirements.txt
 
 RUN mkdir -p /etc/ssh/ssh_config.d && \
