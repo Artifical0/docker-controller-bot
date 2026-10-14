@@ -100,6 +100,19 @@ def test_certificate_falls_back_to_the_volume():
 	assert homelab_paths.certificate("/nonexistent/portainer-cert.pem") == str(homelab_paths.data_file("portainer-cert.pem"))
 
 
+def test_self_update_buttons_reach_the_plugin():
+	assert first_callback_handler("su:deploy:homelab-v5.0.0-h1").__module__ == "homelab.self_update"
+
+
+def test_self_update_orders_versions():
+	from homelab import self_update
+	assert self_update.order("v5.0.0-h10") > self_update.order("v5.0.0-h9")
+	assert self_update.order("v5.1.0-h1") > self_update.order("v5.0.0-h30")
+	# What ran before CI tagged anything sorts first, so the first tag is offered.
+	assert self_update.order("5.0.0-homelab.1") < self_update.order("v5.0.0-h1")
+	assert self_update.version_of("homelab-v5.0.0-h4") == "v5.0.0-h4"
+
+
 if __name__ == "__main__":
 	failed = 0
 	for name, fn in sorted(globals().items()):

@@ -19,7 +19,8 @@ LABEL org.opencontainers.image.title="docker-controller-bot" \
 # TELEMETRY=0 is read by the telemetry client itself and wins over /settings.
 ENV TZ=UTC \
     PYTHONUNBUFFERED=1 \
-    TELEMETRY=0
+    TELEMETRY=0 \
+    HOMELAB_VERSION=${VERSION}
 
 WORKDIR /app
 
