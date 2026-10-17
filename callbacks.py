@@ -587,7 +587,14 @@ def cb_prune(ctx):
 										core.host_alias(host_id), html.escape(str(e.reason))))
 		return
 
+	# A prune can take minutes, and the confirmation is already gone by now
+	# (the dispatcher removes it): without this the chat went quiet until
+	# Docker answered, and running /prune again only got "already running".
+	working = core.send_message(message=f'{core.host_label(host_id)}'
+								f'{get_text("prune_working", get_text(labels[kind]))}')
 	result, data = getattr(owner, f"prune_{kind.lower()}")()
+	if working:
+		core.delete_message(working.message_id)
 	markup = core.create_simple_keyboard("button_delete")
 	if data is None:
 		# It failed: the message says so, and there is nothing to attach.
@@ -884,7 +891,7 @@ def cb_scheduleSelectAction(ctx):
 
 			# Build message with summary
 			message_text = core._build_schedule_summary(schedule_state)
-			message_text += f"\n\n{get_text('schedule_ask_minutes')}"
+			message_text += f"\n\n{core.typed_prompt('schedule_ask_minutes')}"
 
 			markup = InlineKeyboardMarkup(row_width=1)
 			markup.add(InlineKeyboardButton(get_text("button_cancel"), callback_data="cerrar"))
@@ -972,7 +979,7 @@ def cb_scheduleSelectShowOutput(ctx):
 
 		# Build message with summary
 		message_text = core._build_schedule_summary(schedule_state)
-		message_text += f"\n\n{get_text('schedule_ask_command')}"
+		message_text += f"\n\n{core.typed_prompt('schedule_ask_command')}"
 
 		markup = InlineKeyboardMarkup(row_width=1)
 		markup.add(InlineKeyboardButton(get_text("button_cancel"), callback_data="cerrar"))
@@ -1087,7 +1094,7 @@ def cb_scheduleEditField(ctx):
 		# Ask for the new value based on field
 		if ctx.field == "name":
 			message_text = f"<b>{get_text('schedule_edit_name')}</b>\n\n"
-			message_text += f"{get_text('schedule_ask_name')}\n"
+			message_text += f"{core.typed_prompt('schedule_ask_name')}\n"
 			message_text += f"<i>{get_text('current_value')}: {html.escape(schedule_name)}</i>"
 
 			# For text fields, ask for input
@@ -1100,7 +1107,7 @@ def cb_scheduleEditField(ctx):
 		elif ctx.field == "cron":
 			current_cron = schedule.get('cron', '* * * * *')
 			message_text = f"<b>{get_text('schedule_edit_cron')}</b>\n\n"
-			message_text += f"{get_text('schedule_ask_cron')}\n"
+			message_text += f"{core.typed_prompt('schedule_ask_cron')}\n"
 			message_text += f"<i>{get_text('current_value')}: {current_cron}</i>"
 
 			# For text fields, ask for input
@@ -1142,7 +1149,7 @@ def cb_scheduleEditField(ctx):
 		elif ctx.field == "minutes":
 			current_minutes = schedule.get('minutes', '')
 			message_text = f"<b>{get_text('schedule_edit_minutes')}</b>\n\n"
-			message_text += f"{get_text('schedule_ask_minutes')}\n"
+			message_text += f"{core.typed_prompt('schedule_ask_minutes')}\n"
 			message_text += f"<i>{get_text('current_value')}: {current_minutes}</i>"
 
 			# For text fields, ask for input
@@ -1155,7 +1162,7 @@ def cb_scheduleEditField(ctx):
 		elif ctx.field == "command":
 			current_command = schedule.get('command', '')
 			message_text = f"<b>{get_text('schedule_edit_command')}</b>\n\n"
-			message_text += f"{get_text('schedule_ask_command')}\n"
+			message_text += f"{core.typed_prompt('schedule_ask_command')}\n"
 			message_text += f"<i>{get_text('current_value')}: {html.escape(str(current_command or ''))}</i>"
 
 			# For text fields, ask for input

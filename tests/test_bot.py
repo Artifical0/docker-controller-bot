@@ -3919,6 +3919,64 @@ def test_a_schedule_on_a_paused_host_is_skipped_not_disabled():
 		(dcb.schedule_manager.update_schedule, dcb.send_message) = original
 		_restore_hosts()
 
+def test_a_scheduled_prune_does_not_hold_up_the_scheduler():
+	"""
+	The loop runs every task in line, and a prune can now take minutes. One
+	that outlasted the catch-up window made the loop skip the minutes after it,
+	and their tasks with them. It goes to a worker of its own, which still runs
+	them one at a time and in order: a containers prune frees images for the
+	images one due with it.
+	"""
+	_with_hosts([HOST_FIXTURE[0]], unreachable=())
+	release = threading.Event()
+	ran, sent = [], []
+	owner = MagicMock()
+
+	def pruning(kind):
+		def prune():
+			release.wait(5)
+			ran.append(kind)
+			return (f"ok {kind}", None)
+		return prune
+
+	owner.prune_containers.side_effect = pruning("containers")
+	owner.prune_images.side_effect = pruning("images")
+	original = (dcb.manager, dcb.send_message)
+	dcb.manager = lambda host_id=None: owner
+	dcb.send_message = lambda **kw: sent.append(kw.get("message"))
+	try:
+		monitor = dcb.DockerScheduleMonitor()
+		started = time.time()
+		for kind in ("containers", "images"):
+			task = {"id": 1, "name": f"limpia {kind}", "cron": "@daily", "action": "prune",
+					"prune_type": kind, "show_output": True, "host": "h_local", "enabled": True}
+			assert monitor._execute_schedule_action(task) is True
+		assert time.time() - started < 1 and ran == [], "el bucle esperó al prune"
+
+		release.set()
+		deadline = time.time() + 5
+		while len(sent) < 2 and time.time() < deadline:
+			time.sleep(0.01)
+		assert ran == ["containers", "images"], ran
+		assert sent == ["ok containers", "ok images"], sent
+
+		# An unknown type still disables the task there and then.
+		disabled = []
+		original_update = dcb.schedule_manager.update_schedule
+		dcb.schedule_manager.update_schedule = lambda name, **kw: disabled.append(name)
+		try:
+			task = {"id": 2, "name": "rara", "cron": "@daily", "action": "prune",
+					"prune_type": "planets", "host": "h_local", "enabled": True}
+			assert monitor._execute_schedule_action(task) is False
+			assert disabled == ["rara"], disabled
+		finally:
+			dcb.schedule_manager.update_schedule = original_update
+	finally:
+		release.set()
+		dcb.manager, dcb.send_message = original
+		_restore_hosts()
+
+
 def test_a_schedule_on_an_unreachable_host_is_skipped_not_disabled():
 	"""
 	Not paused, just down for a moment: an ssh machine rebooting during the
@@ -4027,7 +4085,13 @@ def test_reboot_tasks_run_in_the_daemon_not_when_it_is_built():
 
 
 def test_the_user_hears_when_a_host_whose_schedules_were_skipped_is_back():
-	"""Checked every minute: a daily task would otherwise say so up to a day late."""
+	"""
+	Checked every minute: a daily task would otherwise say so up to a day late.
+
+	Here only for the local host. A remote one's return is told by
+	HostAvailability, for every host, and saying it here too would be the same
+	news twice; it is still noted, so its next outage is told again.
+	"""
 	import host_registry
 	from datetime import datetime
 	_with_hosts(HOST_FIXTURE)   # nas no responde
@@ -4038,13 +4102,15 @@ def test_the_user_hears_when_a_host_whose_schedules_were_skipped_is_back():
 	try:
 		monitor = dcb.DockerScheduleMonitor()
 		monitor._down_hosts["h_nas"] = True
+		monitor._down_hosts["h_local"] = True
 		host_registry.status_snapshot = lambda entries=None, **kw: {e["id"]: (False, "down") for e in entries}
 		monitor._tick(datetime(2026, 10, 2, 3, 0))
-		assert messages == [] and "h_nas" in monitor._down_hosts, messages
+		assert messages == [] and set(monitor._down_hosts) == {"h_nas", "h_local"}, messages
 		host_registry.status_snapshot = lambda entries=None, **kw: {e["id"]: (True, "") for e in entries}
 		monitor._tick(datetime(2026, 10, 2, 3, 1))
 		monitor._tick(datetime(2026, 10, 2, 3, 2))
-		assert messages == [i18n.get_text("schedule_host_back", "nas")], messages
+		assert messages == [i18n.get_text("schedule_host_back", "casa")], messages
+		assert monitor._down_hosts == {}, monitor._down_hosts
 	finally:
 		(dcb.send_message, dcb.schedule_manager.get_all_schedules, host_registry.status_snapshot) = original
 		_restore_hosts()
@@ -4382,9 +4448,12 @@ def test_a_prune_that_fails_says_so_instead_of_raising():
 	became a ValueError, the button answered nothing, and a scheduled prune
 	only left a line in the log. An answer with nothing to reclaim raised too.
 	"""
+	import host_registry
 	_with_hosts([HOST_FIXTURE[0]], unreachable=())
 	owner = dcb.DockerManager("h_local")
 	owner.client = MagicMock()
+	original_slow = host_registry.slow_client
+	host_registry.slow_client = lambda host_id: owner.client
 	busy = Exception("409 Conflict: a prune operation is already running")
 	for collection in ("containers", "images", "networks", "volumes"):
 		getattr(owner.client, collection).prune.side_effect = busy
@@ -4397,23 +4466,120 @@ def test_a_prune_that_fails_says_so_instead_of_raising():
 		message, details = owner.prune_images()
 		assert details is not None and "0.0B" in message, message
 	finally:
+		host_registry.slow_client = original_slow
 		_restore_hosts()
 
 	# And the button sends the message, with no file to attach.
-	sent, documents = [], []
-	original = (dcb.manager, dcb.send_message, dcb.send_document)
+	# While it runs, a message says so —the confirmation is already gone, the
+	# dispatcher removes it— and it goes once there is an answer.
+	sent, documents, steps = [], [], []
+	original = (dcb.manager, dcb.send_message, dcb.send_document, dcb.delete_message)
 	failing = MagicMock()
-	failing.prune_images.return_value = ("falló", None)
+	failing.prune_images.side_effect = lambda: steps.append("prune") or ("falló", None)
 	dcb.manager = lambda host_id=None: failing
-	dcb.send_message = lambda **kw: sent.append(kw.get("message"))
+
+	def sending(**kw):
+		sent.append(kw.get("message"))
+		steps.append(("send", len(sent)))
+		return MagicMock(message_id=90 + len(sent))
+
+	dcb.send_message = sending
 	dcb.send_document = lambda **kw: documents.append(kw)
+	dcb.delete_message = lambda message_id, chat_id=None: steps.append(("delete", message_id))
 	try:
 		callbacks.cb_prune(callback_registry.Context(
 			call=MagicMock(id="q"), comando="prune", chatId=1, messageId=2, userId=1,
 			multiAction=None, hostId="h_local", containerId=None, action="pruneImages", value="h_local"))
-		assert sent == ["falló"] and documents == [], (sent, documents)
+		working = i18n.get_text("prune_working", i18n.get_text("button_images"))
+		assert len(sent) == 2 and sent[0].endswith(working) and sent[1] == "falló", sent
+		assert documents == [], documents
+		assert steps == [("send", 1), "prune", ("delete", 91), ("send", 2)], steps
+
+		# Through the dispatcher, which is what removes the confirmation: an
+		# edit of it, which is what this first tried, would land on nothing.
+		sent.clear(), steps.clear()
+		press = MagicMock()
+		press.data, press.id = "prune|pruneImages|h_local", "q2"
+		press.message.id, press.message.chat.id = 2, 1
+		press.from_user.id = int(str(dcb.TELEGRAM_ADMIN).split(",")[0])
+		dcb.button_controller(press)
+		assert steps[0] == ("delete", 2) and steps[1:] == [("send", 1), "prune", ("delete", 91), ("send", 2)], steps
 	finally:
-		dcb.manager, dcb.send_message, dcb.send_document = original
+		dcb.manager, dcb.send_message, dcb.send_document, dcb.delete_message = original
+
+
+def test_a_prune_runs_with_the_slow_client_and_says_when_it_ran_out_of_time():
+	"""
+	The daemon cancels a prune when the client hangs up. With the working
+	client's thirty seconds, a slow disk with gigabytes of old images had every
+	/prune cut short: nothing was freed, so the next one failed the same way,
+	and the message sent the user to the logs for an error they could not fix.
+	"""
+	import host_registry
+	import requests
+	_with_hosts([HOST_FIXTURE[0]], unreachable=())
+	owner = dcb.DockerManager("h_local")
+	owner.client = MagicMock()
+	slow = MagicMock()
+	original_slow = host_registry.slow_client
+	host_registry.slow_client = lambda host_id: slow
+	try:
+		slow.images.prune.return_value = {"SpaceReclaimed": 1024}
+		message, details = owner.prune_images()
+		assert details is not None, message
+		slow.images.prune.assert_called_once_with(filters={'dangling': False})
+		owner.client.images.prune.assert_not_called()
+
+		slow.images.prune.side_effect = requests.exceptions.ReadTimeout(
+			"UnixHTTPConnectionPool(host='localhost', port=None): Read timed out. (read timeout=600)")
+		message, details = owner.prune_images()
+		minutes = str(host_registry.SLOW_TIMEOUT_SECONDS // 60)
+		assert details is None, message
+		assert message == i18n.get_text("error_prune_timeout", minutes, "docker image prune -a -f"), message
+
+		# The daemon runs one prune at a time: a scheduled one and a /prune
+		# can meet, and that deserves its own answer, not "see the logs".
+		import docker
+		response = MagicMock(status_code=409)
+		slow.images.prune.side_effect = docker.errors.APIError(
+			"409 Client Error: Conflict", response=response,
+			explanation="a prune operation is already running")
+		message, details = owner.prune_images()
+		assert details is None and message == i18n.get_text("error_prune_busy"), message
+	finally:
+		host_registry.slow_client = original_slow
+		_restore_hosts()
+
+
+def test_the_slow_client_waits_longer_and_is_dropped_with_the_others():
+	"""
+	Raising the working timeout instead would leave a host that stops answering
+	looking frozen for ten minutes. And a slow client left behind by drop()
+	would prune through a connection the rest of the bot already gave up on.
+	"""
+	import copy
+	import docker
+	import host_registry
+
+	asked = []
+
+	def sdk(base_url=None, timeout=None, **kwargs):
+		asked.append(timeout)
+		return MagicMock()
+
+	docker.DockerClient = sdk
+	store.set("hosts", copy.deepcopy(HOST_FIXTURE))
+	host_registry.reset()
+	try:
+		first = host_registry.slow_client("h_nas")
+		assert asked == [host_registry.SLOW_TIMEOUT_SECONDS], asked
+		assert host_registry.SLOW_TIMEOUT_SECONDS > host_registry.DEFAULT_TIMEOUT_SECONDS
+		assert host_registry.slow_client("h_nas") is first, "debe cachearse"
+		assert host_registry.client("h_nas") is not first
+		host_registry.drop("h_nas")
+		assert host_registry.slow_client("h_nas") is not first
+	finally:
+		_restore_hosts()
 
 
 def test_container_output_does_not_break_the_log_message():
@@ -5889,3 +6055,291 @@ def test_a_stop_signal_lets_an_update_finish_and_the_messages_go_out_first():
 		dcb.message_queue.shutdown()
 		dcb.message_queue = original_queue
 		dcb._stopping = False
+
+
+def test_a_typed_question_asks_for_a_reply_where_loose_text_does_not_arrive():
+	"""
+	With BotFather's privacy mode on and the bot not an administrator, a group
+	only delivers it commands, buttons and replies to its own messages. A host
+	URL typed as a plain message was lost without a trace, and the person was
+	left waiting for an answer to something the bot never saw.
+	"""
+	statuses, asked = {}, []
+
+	def member(chat_id, user_id):
+		asked.append(chat_id)
+		if chat_id not in statuses:
+			raise Exception("chat not found")
+		return MagicMock(status=statuses[chat_id])
+
+	original = (dcb._bot_identity, dcb.bot.get_chat_member, dict(dcb._reads_group_text))
+	dcb._bot_identity = MagicMock(id=999, can_read_all_group_messages=False)
+	dcb.bot.get_chat_member = member
+	dcb._reads_group_text.clear()
+	hint = i18n.get_text("reply_to_answer")
+	try:
+		# A private chat always gets the text, and nobody is asked.
+		assert dcb.reads_loose_text(12345) and asked == []
+
+		statuses.update({-100: "member", -200: "administrator", -300: "creator"})
+		assert not dcb.reads_loose_text(-100)
+		assert dcb.reads_loose_text(-200) and dcb.reads_loose_text(-300)
+		# Remembered for a while: a question is not a round trip to Telegram.
+		assert not dcb.reads_loose_text(-100)
+		assert asked.count(-100) == 1, asked
+
+		# Not knowing leaves the question as it was.
+		assert dcb.reads_loose_text(-400)
+
+		# Privacy mode off: everything arrives, admin or not.
+		dcb._reads_group_text.clear()
+		dcb._bot_identity = MagicMock(id=999, can_read_all_group_messages=True)
+		assert dcb.reads_loose_text(-100)
+		dcb._bot_identity = MagicMock(id=999, can_read_all_group_messages=False)
+		dcb._reads_group_text.clear()
+
+		dcb.set_reply_context(-100)
+		assert dcb.typed_prompt("settings_host_ask").endswith(hint)
+		assert dcb.typed_prompt("prompt_enter_command", "nginx").endswith(hint)
+		dcb.set_reply_context(-200)
+		assert hint not in dcb.typed_prompt("settings_host_ask")
+		dcb.set_reply_context(12345)
+		assert dcb.typed_prompt("settings_host_ask") == i18n.get_text("settings_host_ask")
+
+		# And the settings question goes out with it, Cancel button included.
+		sent = []
+		original_send = (dcb.send_message, dcb.save_text_input_state)
+		dcb.send_message = lambda **kw: sent.append(kw) or MagicMock(message_id=7)
+		dcb.save_text_input_state = lambda *a, **k: None
+		try:
+			dcb.set_reply_context(-100)
+			dcb.ask_text_input(1, "host_add", "settings_host_ask", back_to="hosts")
+		finally:
+			dcb.send_message, dcb.save_text_input_state = original_send
+		assert sent[0]["message"].endswith(hint), sent
+		assert harness.keyboard_callbacks(sent[0]["reply_markup"]) == ["cancelTextInput"]
+	finally:
+		dcb.clear_reply_context()
+		dcb._bot_identity, dcb.bot.get_chat_member = original[0], original[1]
+		dcb._reads_group_text.clear()
+		dcb._reads_group_text.update(original[2])
+
+
+def test_every_question_answered_by_typing_goes_through_typed_prompt():
+	"""
+	The note only helps where it is added, and the flows that ask for typed
+	text are spread over two files: a new one built with get_text would drop it
+	without anything failing.
+	"""
+	typed = ("schedule_ask_name", "schedule_ask_cron", "schedule_ask_minutes",
+			"schedule_ask_command", "prompt_enter_command", "ports_ask_port")
+	for filename in ("core.py", "callbacks.py"):
+		source = io.open(os.path.join(harness.REPO, filename), encoding="utf-8").read()
+		for key in typed:
+			assert not re.search(r"get_text\(\s*['\"]" + key + r"['\"]", source), (filename, key)
+
+
+def test_a_log_line_is_written_in_one_go():
+	"""
+	print() writes the text and the newline separately, and two threads logging
+	at once came out as one line glued to the next and an empty one after them:
+	"starting event listener...2026-10-15 19:24:46 - DEBUG: Event monitor..."
+	"""
+	import logger
+	writes = []
+	original = sys.stdout
+	sys.stdout = MagicMock(write=lambda text: writes.append(text))
+	try:
+		logger.debug("uno")
+		logger.warning("dos")
+		logger.error("tres")
+	finally:
+		sys.stdout = original
+	assert len(writes) == 3, writes
+	for text, level in zip(writes, ("DEBUG", "WARNING", "ERROR")):
+		assert text.endswith("\n") and text.count("\n") == 1 and f" - {level}: " in text, text
+
+
+def test_a_host_that_will_not_add_leaves_a_line_in_the_log():
+	"""
+	The refusal went to the chat and nowhere else, so the /logfile sent to ask
+	for help showed nothing about the host that would not add.
+	"""
+	import host_registry
+	logged, sent = [], []
+	original = (dcb.debug, dcb.send_message, host_registry.add_host)
+	dcb.debug = lambda text: logged.append(text)
+	dcb.send_message = lambda **kw: sent.append(kw.get("message"))
+	try:
+		host_registry.add_host = lambda alias, url: (_ for _ in ()).throw(
+			host_registry.HostUnavailable("h_x", "connection refused"))
+		assert dcb.apply_settings_text_value("host_add", "nas tcp://10.0.0.5:2375") is None
+		host_registry.add_host = lambda alias, url: (_ for _ in ()).throw(host_registry.HostRejected("duplicate"))
+		assert dcb.apply_settings_text_value("host_add", "nas tcp://10.0.0.5:2375") is None
+		assert dcb.apply_settings_text_value("host_add", "   ") is None
+	finally:
+		dcb.debug, dcb.send_message, host_registry.add_host = original
+	assert len(sent) == 3, sent
+	assert any("tcp://10.0.0.5:2375" in line and "connection refused" in line for line in logged), logged
+	assert any("tcp://10.0.0.5:2375" in line and "duplicate" in line for line in logged), logged
+	assert len(logged) == 3, logged
+
+
+def test_a_remote_host_that_stops_answering_is_announced_and_so_is_its_return():
+	"""
+	A machine that went down took its notifications with it and nothing said
+	so: its event stream only wrote to the log. Two minutes first, so a Docker
+	restart or a blip in the network is not news; and its return only when its
+	fall was told.
+	"""
+	_with_hosts(HOST_FIXTURE, unreachable=())
+	sent = []
+	original = (dcb.send_message_to_notification_channel, dcb.is_muted)
+	dcb.send_message_to_notification_channel = lambda message=None, **kw: sent.append(message)
+	muted = [False]
+	dcb.is_muted = lambda: muted[0]
+	try:
+		availability = dcb.HostAvailability()
+		down = {"h_nas": (False, "connection refused")}
+		up = {"h_nas": (True, "")}
+
+		availability.update(down, now=1000)
+		availability.update(down, now=1090)
+		assert sent == [], "avisó antes de los dos minutos"
+		availability.update(down, now=1120)
+		assert sent == [i18n.get_text("host_down", "nas", i18n.get_text("info_minutes", 2), "connection refused")], sent
+		availability.update(down, now=1150)
+		assert len(sent) == 1, "lo repitió"
+
+		availability.update(up, now=1000 + 7800)
+		assert sent[1] == i18n.get_text("host_back", "nas", i18n.get_text("info_hours", 2)), sent
+
+		# A blip shorter than the threshold says nothing, either way.
+		sent.clear()
+		availability.update(down, now=20000)
+		availability.update(up, now=20060)
+		assert sent == [], sent
+
+		# Muted: the fall waits for the mute to end, if it is still down then,
+		# and so does a return that comes while muted.
+		availability.update(down, now=30000)
+		muted[0] = True
+		availability.update(down, now=30200)
+		assert sent == [], sent
+		muted[0] = False
+		availability.update(down, now=30230)
+		assert sent == [i18n.get_text("host_down", "nas", i18n.get_text("info_minutes", 3), "connection refused")], sent
+		muted[0] = True
+		availability.update(up, now=30600)
+		assert len(sent) == 1, sent
+		muted[0] = False
+		availability.update(up, now=31000)
+		assert sent[1] == i18n.get_text("host_back", "nas", i18n.get_text("info_minutes", 10)), sent
+
+		# Paused or removed while down: forgotten without a word.
+		sent.clear()
+		availability.update(down, now=40000)
+		availability.update(down, now=40200)
+		assert len(sent) == 1
+		availability.update({}, now=40230)
+		availability.update(up, now=40260)
+		assert len(sent) == 1, sent
+
+		# What reason Docker gave is shown as text, never as markup.
+		sent.clear()
+		availability.update({"h_nas": (False, "<b>no</b>")}, now=50000)
+		availability.update({"h_nas": (False, "<b>no</b>")}, now=50200)
+		assert "&lt;b&gt;no&lt;/b&gt;" in sent[0], sent
+
+		# And the bot's own "no answer in 5s" goes in the user's language,
+		# while the log keeps reading it in English.
+		import host_registry
+		availability.update(up, now=50300)
+		sent.clear()
+		silent = host_registry.NoAnswer(5)
+		assert str(silent) == "no answer in 5s"
+		availability.update({"h_nas": (False, silent)}, now=60000)
+		availability.update({"h_nas": (False, silent)}, now=60200)
+		assert sent == [i18n.get_text("host_down", "nas", i18n.get_text("info_minutes", 3),
+										i18n.get_text("host_no_answer", 5))], sent
+	finally:
+		dcb.send_message_to_notification_channel, dcb.is_muted = original
+		_restore_hosts()
+
+
+def test_only_remote_hosts_that_are_not_paused_are_watched():
+	"""
+	The local socket is the daemon the bot runs on: without live-restore a
+	daemon that stops takes the bot with it, and with it a restart is seconds.
+	"""
+	watched = dcb.HostAvailability.watched
+	assert not watched({"id": "h_local", "url": "unix:///var/run/docker.sock"})
+	assert not watched({"id": "h_local"})
+	assert watched({"id": "h_nas", "url": "tcp://nas:2375"})
+	assert watched({"id": "h_pi", "url": "ssh://pi@pi"})
+	assert not watched({"id": "h_pi", "url": "ssh://pi@pi", "paused": True})
+
+
+def test_the_supervisor_feeds_the_availability_and_wakes_a_monitor_whose_host_is_back():
+	"""
+	After a long outage a monitor waits up to five minutes before trying again,
+	and the host's notifications would come that much after the news that it
+	is back.
+	"""
+	import host_registry
+	_with_hosts(HOST_FIXTURE, unreachable=())
+	original = host_registry.status_snapshot
+	host_registry.status_snapshot = lambda entries=None, **kw: {e["id"]: (True, "") for e in entries}
+	try:
+		supervisor = dcb.EventMonitorSupervisor()
+		fed = []
+		supervisor.availability = MagicMock(update=lambda statuses: fed.append(statuses))
+		waiting, listening = MagicMock(host_id="h_nas", listening=False), MagicMock(host_id="h_local", listening=True)
+		supervisor._check_hosts([waiting, listening])
+		waiting.retry_now.assert_called_once()
+		listening.retry_now.assert_not_called()
+		listening.reset_stream.assert_not_called()
+		# Only the remote host is handed over.
+		assert fed == [{"h_nas": (True, "")}], fed
+
+		host_registry.status_snapshot = lambda entries=None, **kw: {e["id"]: (False, "down") for e in entries}
+		supervisor._check_hosts([listening])
+		listening.reset_stream.assert_called_once()
+	finally:
+		host_registry.status_snapshot = original
+		_restore_hosts()
+
+
+def test_a_monitor_told_to_retry_stops_waiting():
+	"""The loop waits out its backoff unless the host is known to be back."""
+	import host_registry
+	_with_hosts(HOST_FIXTURE, unreachable=())
+	monitor = dcb.DockerEventMonitor("h_nas")
+	attempts = []
+
+	def connecting():
+		attempts.append(time.time())
+		raise Exception("connection refused")
+
+	monitor.detectar_eventos_contenedores = connecting
+	original_drop = host_registry.drop
+	host_registry.drop = lambda host_id: None
+	try:
+		monitor.demonio_event()
+		deadline = time.time() + 2
+		while not attempts and time.time() < deadline:
+			time.sleep(0.01)
+		assert len(attempts) == 1, attempts
+		time.sleep(0.3)
+		assert len(attempts) == 1, "no esperó el backoff"
+		monitor.retry_now()
+		deadline = time.time() + 2
+		while len(attempts) < 2 and time.time() < deadline:
+			time.sleep(0.01)
+		assert len(attempts) == 2, "siguió esperando con el host de vuelta"
+	finally:
+		monitor.stop()
+		monitor.thread.join(2)
+		host_registry.drop = original_drop
+		_restore_hosts()
+	assert not monitor.thread.is_alive()

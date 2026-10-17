@@ -5,6 +5,7 @@ import html
 import io
 import json
 import os
+import queue
 import re
 import requests
 import shlex
@@ -26,7 +27,7 @@ from telebot.types import InlineKeyboardButton
 from telebot.types import InlineKeyboardMarkup
 from compose_generator import ComposeGenerator
 from formatting import (
-	EVENT_LOG_LINES, by_host, render_container_info, comparison_version_change, comparison_version_line, comparison_version_notes, container_line, describe_exit_code, log_excerpt, release_notes_url, version_lines,
+	EVENT_LOG_LINES, by_host, render_container_info, comparison_version_change, comparison_version_line, comparison_version_notes, container_line, describe_exit_code, human_duration, log_excerpt, release_notes_url, version_lines,
 )
 from docker_update import container_platform, extract_container_config, image_repository, image_version, perform_update, stop_container, updates_in_progress
 from docker_compose_manager import (
@@ -43,7 +44,7 @@ from i18n import get_text, language
 from logger import debug, error, warning
 from message_queue import MessageQueue
 
-VERSION = "5.0.0"
+VERSION = "5.1.0"
 
 _unmute_timer = None
 _mute_lock = threading.Lock()  # Lock for thread-safe mute timer operations
@@ -662,7 +663,8 @@ class DockerManager:
 				has_update = False
 				send_message(message=f'{get_text("already_updated", container.name)}{host_suffix(self.host_id)}')
 		except Exception as e:
-			error(f"Could not check update: [{e}]")
+			error(f"Could not check update for {getattr(container, 'name', container_id)} "
+				  f"({image_with_tag or '?'}) on {self.alias}: [{e}]")
 			has_update = None
 			if loading_msg:
 				try:
@@ -694,44 +696,54 @@ class DockerManager:
 	# ValueError: the /prune button answered nothing, and a scheduled one only
 	# left a line in the log.
 	def prune_containers(self):
-		try:
-			pruned_containers = self.client.containers.prune()
-			file_size_bytes = sizeof_fmt((pruned_containers or {}).get('SpaceReclaimed') or 0)
-			debug(f"Deleted: [{str(pruned_containers)}] - Space reclaimed: {str(file_size_bytes)}")
-			return get_text("prune_containers", str(file_size_bytes)), str(pruned_containers)
-		except Exception as e:
-			error(f"An error has occurred deleting unused containers. Error: [{e}]")
-			return get_text("error_prune_containers"), None
+		return self._prune("containers", "prune_containers", "error_prune_containers", "docker container prune -f", reclaims=True)
 
 	def prune_images(self):
-		try:
-			pruned_images = self.client.images.prune(filters={'dangling': False})
-			file_size_bytes = sizeof_fmt((pruned_images or {}).get('SpaceReclaimed') or 0)
-			debug(f"Deleted: [{str(pruned_images)}] - Space reclaimed: {str(file_size_bytes)}")
-			return get_text("prune_images", str(file_size_bytes)), str(pruned_images)
-		except Exception as e:
-			error(f"An error occurred deleting unused images. Error: [{e}]")
-			return get_text("error_prune_images"), None
+		return self._prune("images", "prune_images", "error_prune_images", "docker image prune -a -f", reclaims=True, filters={'dangling': False})
 
 	def prune_networks(self):
-		try:
-			pruned_networks = self.client.networks.prune()
-			debug(f"Deleted: [{str(pruned_networks)}]")
-			return get_text("prune_networks"), str(pruned_networks)
-		except Exception as e:
-			error(f"An error occurred while deleting unused networks. Error: [{e}]")
-			return get_text("error_prune_networks"), None
-
+		return self._prune("networks", "prune_networks", "error_prune_networks", "docker network prune -f", reclaims=False)
 
 	def prune_volumes(self):
+		return self._prune("volumes", "prune_volumes", "error_prune_volumes", "docker volume prune -f", reclaims=True)
+
+	def _prune(self, collection, done_key, error_key, command, reclaims, **kwargs):
+		"""
+		Runs one prune through the host's slow client.
+
+		The working client gives up after thirty seconds, and the daemon
+		cancels a prune as soon as the client hangs up: on a slow disk with
+		gigabytes of old images every attempt was cut short, nothing was freed
+		and the next one had just as much to do. A timeout that still runs out
+		says so, with the command that does the same on the server, instead of
+		pointing at the logs for an error there is nothing to do about.
+		"""
 		try:
-			pruned_volumes = self.client.volumes.prune()
-			file_size_bytes = sizeof_fmt((pruned_volumes or {}).get('SpaceReclaimed') or 0)
-			debug(f"Deleted: [{str(pruned_volumes)}] - Space reclaimed: {str(file_size_bytes)}")
-			return get_text("prune_volumes", str(file_size_bytes)), str(pruned_volumes)
+			connection = host_registry.slow_client(self.host_id)
+		except host_registry.HostUnavailable:
+			connection = self.client
+		try:
+			pruned = getattr(connection, collection).prune(**kwargs)
+			if not reclaims:
+				debug(f"Deleted: [{str(pruned)}]")
+				return get_text(done_key), str(pruned)
+			file_size_bytes = sizeof_fmt((pruned or {}).get('SpaceReclaimed') or 0)
+			debug(f"Deleted: [{str(pruned)}] - Space reclaimed: {str(file_size_bytes)}")
+			return get_text(done_key, str(file_size_bytes)), str(pruned)
+		except requests.exceptions.Timeout as e:
+			error(f"Docker did not finish pruning {collection} in time, so it cancelled it. Error: [{e}]")
+			return get_text("error_prune_timeout", str(host_registry.SLOW_TIMEOUT_SECONDS // 60), command), None
+		except docker.errors.APIError as e:
+			# The daemon runs one prune at a time. A scheduled one and a /prune
+			# can meet, and that is not an error worth reading the logs for.
+			if e.status_code == 409 and "already running" in str(e):
+				warning(f"Not pruning {collection}: Docker is already running a prune. [{e}]")
+				return get_text("error_prune_busy"), None
+			error(f"An error occurred deleting unused {collection}. Error: [{e}]")
+			return get_text(error_key), None
 		except Exception as e:
-			error(f"An error occurred deleting unused volumes. Error: [{e}]")
-			return get_text("error_prune_volumes"), None
+			error(f"An error occurred deleting unused {collection}. Error: [{e}]")
+			return get_text(error_key), None
 
 	def execute_command(self, container_id, container_name, command):
 		try:
@@ -1278,6 +1290,8 @@ class DockerEventMonitor:
 	def __init__(self, host_id):
 		self.host_id = host_id
 		self._stop = threading.Event()
+		# Set to cut the wait before the next reconnection short.
+		self._retry_now = threading.Event()
 		self._stream = None
 		self._stream_lock = threading.Lock()
 		# The newest event seen, in nanoseconds, so a reconnection can ask
@@ -1314,8 +1328,17 @@ class DockerEventMonitor:
 		for a connection left open, and over ssh that is a process.
 		"""
 		self._stop.set()
+		self._retry_now.set()
 		self.reset_stream()
 		host_registry.drop(self.host_id)
+
+	def retry_now(self):
+		"""
+		Reconnects without waiting out the backoff, because the host answers
+		again. After a long outage the wait is five minutes, and the host's
+		notifications would arrive that much after the news that it is back.
+		"""
+		self._retry_now.set()
 
 	def reset_stream(self):
 		"""
@@ -1557,7 +1580,9 @@ class DockerEventMonitor:
 			# Force a fresh connection on the next attempt.
 			host_registry.drop(self.host_id)
 			backoff = min(5 * (2 ** min(failures, 6)), self.MAX_BACKOFF_SECONDS) if failures else 5
-			if self._stop.wait(backoff):
+			self._retry_now.wait(backoff)
+			self._retry_now.clear()
+			if self._stop.is_set():
 				break
 		debug(f"Event monitor ({self.alias}) stopped")
 
@@ -1567,6 +1592,94 @@ class DockerEventMonitor:
 		self.thread.start()
 		debug(f"Event monitor daemon started for {self.alias}")
 		return self.thread
+
+
+class HostAvailability:
+	"""
+	Says when a remote host stops answering, and when it answers again.
+
+	Without it a machine that went down took its notifications with it and
+	nothing said so: its event stream only wrote to the log, and the user found
+	out the next time they tried to do something there.
+
+	Remote hosts only. The one behind the local socket is the daemon the bot
+	itself runs on: without Docker's live-restore, a daemon that stops takes
+	the bot down with it and there is nobody left to say so, and with it, a
+	restart is over in seconds.
+
+	Fed by the event monitor supervisor, which already asks every host whether
+	it answers every RECONCILE_SECONDS.
+	"""
+
+	# How long a host has to go without answering before it is announced. A
+	# Docker restart or a blip in the network is over well before this.
+	DOWN_AFTER_SECONDS = 120
+
+	def __init__(self):
+		# {host_id: (since, reason)} for every watched host failing right now.
+		self._failing = {}
+		# {host_id: since} for the ones announced as down.
+		self._announced = {}
+		# {host_id: seconds it was down} for recoveries that came while muted.
+		# Said once the mute ends: the user heard it go down, and silence
+		# afterwards would read as still down.
+		self._pending_back = {}
+
+	@staticmethod
+	def watched(entry):
+		"""Whether a host's outages are announced: remote and not paused."""
+		url = entry.get("url") or host_registry.LOCAL_SOCKET_URL
+		return not entry.get("paused") and not url.startswith("unix://")
+
+	def update(self, statuses, now=None):
+		"""
+		Takes one round of answers, as {host_id: (ok, reason)} for the watched
+		hosts, and announces what changed.
+
+		A host missing from the round —removed, paused— is forgotten without
+		a word: whoever did that knows.
+		"""
+		now = time.time() if now is None else now
+		for book in (self._failing, self._announced, self._pending_back):
+			for host_id in [h for h in book if h not in statuses]:
+				book.pop(host_id)
+		muted = is_muted()
+		for host_id, (ok, reason) in statuses.items():
+			if ok:
+				self._failing.pop(host_id, None)
+				since = self._announced.pop(host_id, None)
+				if since is not None:
+					self._pending_back[host_id] = now - since
+				continue
+			# Down again before its recovery could be told: that is old news.
+			self._pending_back.pop(host_id, None)
+			since = self._failing.get(host_id, (now, ""))[0]
+			self._failing[host_id] = (since, reason)
+			if host_id in self._announced or now - since < self.DOWN_AFTER_SECONDS or muted:
+				continue
+			self._announced[host_id] = since
+			debug(f"Host {host_registry.alias(host_id)} has not answered for {int(now - since)} s ({reason}): announcing it")
+			self._send(get_text("host_down", host_alias(host_id),
+								human_duration(now - since), self._reason(reason)))
+		if muted:
+			return
+		for host_id, downtime in list(self._pending_back.items()):
+			debug(f"Host {host_registry.alias(host_id)} answers again after {int(downtime)} s: announcing it")
+			self._send(get_text("host_back", host_alias(host_id), human_duration(downtime)))
+		self._pending_back.clear()
+
+	@staticmethod
+	def _reason(reason):
+		"""Why it failed, as text: in the user's language when the words are the bot's own."""
+		if isinstance(reason, host_registry.NoAnswer):
+			return get_text("host_no_answer", reason.seconds)
+		return html.escape(str(reason or "?"))
+
+	def _send(self, message):
+		try:
+			send_message_to_notification_channel(message=message)
+		except Exception as e:
+			error(f"Could not send notification [{message}]. Error: [{e}]")
 
 
 class EventMonitorSupervisor:
@@ -1584,6 +1697,7 @@ class EventMonitorSupervisor:
 	def __init__(self):
 		self._monitors = {}
 		self._lock = threading.Lock()
+		self.availability = HostAvailability()
 
 	def reconcile(self):
 		"""
@@ -1608,27 +1722,38 @@ class EventMonitorSupervisor:
 					replacement._last_event_ns = monitor._last_event_ns
 					self._monitors[host_id] = replacement
 					replacement.demonio_event()
-			listening = [m for m in self._monitors.values() if m.listening]
-		self._check_streams(listening)
+			monitors = list(self._monitors.values())
+		self._check_hosts(monitors)
 
-	def _check_streams(self, monitors):
+	def _check_hosts(self, monitors):
 		"""
-		Reconnects every stream whose host no longer answers.
+		Asks every host whether it answers, and acts on it.
 
 		A stream over tcp that the other end dropped without closing —a reboot,
 		a power cut— looks exactly like a quiet one: nothing arrives either
-		way. Asking the daemon tells them apart. ssh needs this less, its own
-		keepalive ends the connection, but asking costs the same.
+		way. Asking the daemon tells them apart, and the stream is reconnected.
+		ssh needs this less, its own keepalive ends the connection, but asking
+		costs the same.
+
+		A monitor waiting to reconnect to a host that answers again stops
+		waiting. And the answers go to the availability, which says when a
+		remote host goes down and comes back.
 		"""
 		if not monitors:
+			self.availability.update({})
 			return
-		entries = [host_registry.host(m.host_id) for m in monitors]
-		statuses = host_registry.status_snapshot(entries=[e for e in entries if e])
+		entries = {m.host_id: host_registry.host(m.host_id) for m in monitors}
+		statuses = host_registry.status_snapshot(entries=[e for e in entries.values() if e])
 		for monitor in monitors:
 			ok, reason = statuses.get(monitor.host_id, (True, ""))
-			if not ok:
+			listening = monitor.listening
+			if listening and not ok:
 				debug(f"Event monitor ({monitor.alias}): host not answering ({reason}), reconnecting")
 				monitor.reset_stream()
+			elif ok and not listening:
+				monitor.retry_now()
+		self.availability.update({host_id: statuses[host_id] for host_id, entry in entries.items()
+									if entry and host_id in statuses and HostAvailability.watched(entry)})
 
 	def _supervise(self):
 		while True:
@@ -1904,7 +2029,10 @@ class DockerUpdateMonitor:
 				# —a Docker Hub rate limit, a registry down for the night— made
 				# the next pass that worked take an update it had already
 				# announced for a new one, and announce it again.
-				error(f"Could not check update: [{e}]")
+				# Named, because the error alone —a registry that does not
+				# resolve, say— does not always say which container it was.
+				error(f"Could not check update for {container.name} ({image_with_tag}) "
+					  f"on {host_registry.alias(host_id)}: [{e}]")
 				continue
 			save_container_update_status(image_with_tag, container.name, has_update, host_id, versions)
 
@@ -1954,6 +2082,15 @@ def schedule_container_ref(host_id, container_name):
 	return container_ref(host_id, container) if container is not None else None
 
 
+# What a scheduled prune can clean, and the name its output file goes by.
+SCHEDULED_PRUNE_LABELS = {
+	"containers": "button_containers",
+	"images": "button_images",
+	"networks": "button_networks",
+	"volumes": "button_volumes",
+}
+
+
 class DockerScheduleMonitor:
 	# How many minutes the loop makes up for when it falls behind —a slow
 	# action, a busy machine— before it gives up on them. Past that the gap is
@@ -1971,6 +2108,11 @@ class DockerScheduleMonitor:
 		# {host_id: True}. The user hears once when it starts and once when
 		# it ends, not on every skipped run.
 		self._down_hosts = {}
+		# Scheduled prunes, run by a worker of their own in the order they came
+		# due. Started on the first one: most installations never have any.
+		self._prunes = queue.Queue()
+		self._prune_lock = threading.Lock()
+		self._prune_worker = None
 
 	def _execute_reboot_tasks(self):
 		"""Execute all @reboot tasks, once, when the daemon starts"""
@@ -2063,40 +2205,13 @@ class DockerScheduleMonitor:
 				execute_command(containerId, container, command, show_output)
 
 			elif action == "prune":
-				# Execute prune based on type
-				result_message = None
-				data = None
-				prune_label = ""
-
-				if prune_type == "containers":
-					result_message, data = manager(schedule_host).prune_containers()
-					prune_label = get_text("button_containers")
-				elif prune_type == "images":
-					result_message, data = manager(schedule_host).prune_images()
-					prune_label = get_text("button_images")
-				elif prune_type == "networks":
-					result_message, data = manager(schedule_host).prune_networks()
-					prune_label = get_text("button_networks")
-				elif prune_type == "volumes":
-					result_message, data = manager(schedule_host).prune_volumes()
-					prune_label = get_text("button_volumes")
-				else:
+				if prune_type not in SCHEDULED_PRUNE_LABELS:
 					return handle_error(f"Unknown prune type: {prune_type}")
-
-				# Show output if requested, otherwise just log
-				if show_output and result_message and data is None:
-					send_message(message=result_message)
-				elif show_output and result_message:
-					# Send the same format as manual /prune command
-					markup = InlineKeyboardMarkup(row_width=1)
-					markup.add(InlineKeyboardButton(get_text("button_delete"), callback_data="cerrar"))
-					fichero_temporal = get_temporal_file(data, prune_label)
-					x = send_message(message=get_text("loading_file"))
-					send_document(document=fichero_temporal, reply_markup=markup, caption=result_message)
-					if x:
-						delete_message(x.message_id)
-				else:
-					debug(f"Scheduled prune executed: {result_message}")
+				# Handed to its own worker: a prune can take minutes, and this
+				# loop runs every task in line. One that outlasted the catch-up
+				# window made the loop skip the minutes after it —logged as if
+				# the bot had not been running— and their tasks with them.
+				self._queue_prune(manager(schedule_host), prune_type, show_output)
 
 			return True
 
@@ -2114,6 +2229,46 @@ class DockerScheduleMonitor:
 		except Exception as e:
 			error(f"Error executing schedule action [{action}]: [{str(e)}]")
 			return False
+
+	def _queue_prune(self, owner, prune_type, show_output):
+		"""Leaves a scheduled prune to the prune worker, starting it if needed."""
+		self._prunes.put((owner, prune_type, show_output))
+		with self._prune_lock:
+			if self._prune_worker is None or not self._prune_worker.is_alive():
+				self._prune_worker = threading.Thread(target=self._prune_loop, daemon=True)
+				self._prune_worker.start()
+
+	def _prune_loop(self):
+		"""
+		Runs the queued prunes one after another.
+
+		One at a time and in order, as the loop used to: a containers prune
+		due with an images one frees images the second can then remove, and
+		two at once on the same host only get Docker's "already running".
+		"""
+		while True:
+			owner, prune_type, show_output = self._prunes.get()
+			try:
+				self._run_prune(owner, prune_type, show_output)
+			except Exception as e:
+				error(f"Error executing schedule action [prune]: [{str(e)}]")
+
+	def _run_prune(self, owner, prune_type, show_output):
+		result_message, data = getattr(owner, f"prune_{prune_type}")()
+		# Show output if requested, otherwise just log
+		if show_output and result_message and data is None:
+			send_message(message=result_message)
+		elif show_output and result_message:
+			# Send the same format as manual /prune command
+			markup = InlineKeyboardMarkup(row_width=1)
+			markup.add(InlineKeyboardButton(get_text("button_delete"), callback_data="cerrar"))
+			fichero_temporal = get_temporal_file(data, get_text(SCHEDULED_PRUNE_LABELS[prune_type]))
+			x = send_message(message=get_text("loading_file"))
+			send_document(document=fichero_temporal, reply_markup=markup, caption=result_message)
+			if x:
+				delete_message(x.message_id)
+		else:
+			debug(f"Scheduled prune executed: {result_message}")
 
 	def run(self):
 		"""
@@ -2178,6 +2333,11 @@ class DockerScheduleMonitor:
 		daily task would otherwise announce the host back up to a day late.
 		Only the hosts that are down are asked, so a healthy fleet costs
 		nothing here.
+
+		A remote host's return is told by HostAvailability, for every host and
+		not only the ones with tasks, so here it is only noted: saying it twice
+		would be one message too many. What is left to say here is the local
+		host, which that one does not watch.
 		"""
 		if not self._down_hosts:
 			return
@@ -2186,8 +2346,9 @@ class DockerScheduleMonitor:
 			# Removed meanwhile: nothing will come back.
 			self._down_hosts.pop(host_id, None)
 		statuses = host_registry.status_snapshot(entries=[e for e in entries if e])
+		watched = {e["id"] for e in entries if e and HostAvailability.watched(e)}
 		for host_id, (ok, _reason) in statuses.items():
-			if ok and self._down_hosts.pop(host_id, None):
+			if ok and self._down_hosts.pop(host_id, None) and host_id not in watched:
 				self._notify(get_text("schedule_host_back", host_alias(host_id)))
 
 	def _tick(self, now):
@@ -2520,7 +2681,7 @@ def show_schedule_edit_options(user_id: int, schedule_name: str):
 def ask_schedule_name(user_id: int):
 	"""Ask user for schedule name"""
 	state = init_add_schedule_state()
-	message_text = get_text("schedule_ask_name")
+	message_text = typed_prompt("schedule_ask_name")
 	msg = send_message(message=message_text, reply_markup=create_simple_keyboard("button_cancel"))
 	state["last_message_id"] = msg.message_id if msg else None
 	save_schedule_state(user_id, state)
@@ -2716,7 +2877,7 @@ def handle_schedule_flow(user_id: int, user_input: str, state: dict, chat_id: in
 				send_message(message=get_text("schedule_name_exists"))
 				# Re-ask for name
 				message_text = f"<b>{get_text('schedule_edit_name')}</b>\n\n"
-				message_text += f"{get_text('schedule_ask_name')}\n"
+				message_text += f"{typed_prompt('schedule_ask_name')}\n"
 				message_text += f"<i>{get_text('current_value')}: {html.escape(schedule_name)}</i>"
 				markup = InlineKeyboardMarkup(row_width=1)
 				markup.add(InlineKeyboardButton(get_text("button_cancel"), callback_data="cerrar"))
@@ -2744,7 +2905,7 @@ def handle_schedule_flow(user_id: int, user_input: str, state: dict, chat_id: in
 				current_cron = schedule.get('cron', '* * * * *')
 				message_text = f"❌ <b>{get_text('schedule_invalid_cron')}</b>\n\n"
 				message_text += f"<b>{get_text('schedule_edit_cron')}</b>\n\n"
-				message_text += f"{get_text('schedule_ask_cron')}\n"
+				message_text += f"{typed_prompt('schedule_ask_cron')}\n"
 				message_text += f"<i>{get_text('current_value')}: {current_cron}</i>"
 				markup = InlineKeyboardMarkup(row_width=1)
 				markup.add(InlineKeyboardButton(get_text("button_cancel"), callback_data="cerrar"))
@@ -2786,7 +2947,7 @@ def handle_schedule_flow(user_id: int, user_input: str, state: dict, chat_id: in
 					current_minutes = schedule.get('minutes', '')
 					message_text = f"❌ <b>{get_text('schedule_invalid_minutes')}</b>\n\n"
 					message_text += f"<b>{get_text('schedule_edit_minutes')}</b>\n\n"
-					message_text += f"{get_text('schedule_ask_minutes')}\n"
+					message_text += f"{typed_prompt('schedule_ask_minutes')}\n"
 					message_text += f"<i>{get_text('current_value')}: {current_minutes}</i>"
 					markup = InlineKeyboardMarkup(row_width=1)
 					markup.add(InlineKeyboardButton(get_text("button_cancel"), callback_data="cerrar"))
@@ -2807,7 +2968,7 @@ def handle_schedule_flow(user_id: int, user_input: str, state: dict, chat_id: in
 				current_minutes = schedule.get('minutes', '')
 				message_text = f"❌ <b>{get_text('schedule_invalid_minutes')}</b>\n\n"
 				message_text += f"<b>{get_text('schedule_edit_minutes')}</b>\n\n"
-				message_text += f"{get_text('schedule_ask_minutes')}\n"
+				message_text += f"{typed_prompt('schedule_ask_minutes')}\n"
 				message_text += f"<i>{get_text('current_value')}: {current_minutes}</i>"
 				markup = InlineKeyboardMarkup(row_width=1)
 				markup.add(InlineKeyboardButton(get_text("button_cancel"), callback_data="cerrar"))
@@ -2833,7 +2994,7 @@ def handle_schedule_flow(user_id: int, user_input: str, state: dict, chat_id: in
 
 			# Show error message with re-ask for name in the same message
 			message_text = f"❌ <b>{get_text('schedule_name_exists')}</b>\n\n"
-			message_text += get_text("schedule_ask_name")
+			message_text += typed_prompt("schedule_ask_name")
 
 			markup = InlineKeyboardMarkup(row_width=1)
 			markup.add(InlineKeyboardButton(get_text("button_cancel"), callback_data="cerrar"))
@@ -2854,7 +3015,7 @@ def handle_schedule_flow(user_id: int, user_input: str, state: dict, chat_id: in
 
 		# Build message with summary
 		message_text = f"<b>{get_text('schedule_label_name')}:</b> {html.escape(user_input)}\n\n"
-		message_text += get_text("schedule_ask_cron")
+		message_text += typed_prompt("schedule_ask_cron")
 
 		markup = InlineKeyboardMarkup(row_width=1)
 		markup.add(InlineKeyboardButton(get_text("button_cancel"), callback_data="cerrar"))
@@ -2877,7 +3038,7 @@ def handle_schedule_flow(user_id: int, user_input: str, state: dict, chat_id: in
 			# Add current progress
 			if state.get("name"):
 				message_text += f"<b>{get_text('schedule_label_name')}:</b> {html.escape(str(state.get('name')))}\n\n"
-			message_text += get_text("schedule_ask_cron")
+			message_text += typed_prompt("schedule_ask_cron")
 
 			markup = InlineKeyboardMarkup(row_width=1)
 			markup.add(InlineKeyboardButton(get_text("button_cancel"), callback_data="cerrar"))
@@ -2935,7 +3096,7 @@ def handle_schedule_flow(user_id: int, user_input: str, state: dict, chat_id: in
 				message_text = f"❌ <b>{get_text('schedule_invalid_minutes')}</b>\n\n"
 				# Add current progress
 				message_text += _build_schedule_summary(state)
-				message_text += f"\n\n{get_text('schedule_ask_minutes')}"
+				message_text += f"\n\n{typed_prompt('schedule_ask_minutes')}"
 
 				markup = InlineKeyboardMarkup(row_width=1)
 				markup.add(InlineKeyboardButton(get_text("button_cancel"), callback_data="cerrar"))
@@ -2955,7 +3116,7 @@ def handle_schedule_flow(user_id: int, user_input: str, state: dict, chat_id: in
 			message_text = f"❌ <b>{get_text('schedule_invalid_minutes')}</b>\n\n"
 			# Add current progress
 			message_text += _build_schedule_summary(state)
-			message_text += f"\n\n{get_text('schedule_ask_minutes')}"
+			message_text += f"\n\n{typed_prompt('schedule_ask_minutes')}"
 
 			markup = InlineKeyboardMarkup(row_width=1)
 			markup.add(InlineKeyboardButton(get_text("button_cancel"), callback_data="cerrar"))
@@ -3550,6 +3711,54 @@ def show_settings_columns(chat_id, message_id):
 	_add_navigation(markup, "settings")
 	edit_message_text(get_text("button_settings_columns"), chat_id, message_id, reply_markup=markup)
 
+# How long a group's answer to "can the bot read loose text here" is trusted.
+# Becoming admin is not something the bot hears about, so it has to expire.
+_READS_GROUP_TEXT_TTL = 600
+_reads_group_text = {}
+
+def reads_loose_text(chat_id):
+	"""
+	Whether a message typed in `chat_id` without replying reaches the bot.
+
+	Always in a private chat. In a group, only when BotFather's privacy mode is
+	off or the bot is an administrator there: otherwise Telegram delivers it
+	commands, buttons and replies to its own messages, and nothing else. A
+	value typed as a plain message was lost without a trace, and the person
+	was left waiting for an answer to something the bot never saw.
+
+	Unknown counts as yes, so a failed lookup leaves the question as it was.
+	"""
+	try:
+		chat_id = int(chat_id)
+	except (TypeError, ValueError):
+		return True
+	if chat_id > 0:
+		return True
+	cached = _reads_group_text.get(chat_id)
+	if cached and time.time() - cached[1] < _READS_GROUP_TEXT_TTL:
+		return cached[0]
+	try:
+		me = bot_identity()
+		reads = bool(getattr(me, "can_read_all_group_messages", False)) or \
+			bot.get_chat_member(chat_id, me.id).status in ("administrator", "creator")
+	except Exception as e:
+		debug(f"Could not tell whether I read loose text in chat {chat_id}: {e}")
+		return True
+	if not reads:
+		debug(f"Chat {chat_id}: I only see replies to my messages, so typed answers are asked for as replies")
+	_reads_group_text[chat_id] = (reads, time.time())
+	return reads
+
+def typed_prompt(key, *args):
+	"""
+	A question answered by typing, with a note to reply to it when typing
+	alone would not reach the bot.
+	"""
+	text = get_text(key, *args)
+	if not reads_loose_text(get_reply_chat_id()):
+		text += f"\n\n{get_text('reply_to_answer')}"
+	return text
+
 def ask_text_input(user_id, field, prompt_key, back_to="main"):
 	"""
 	Asks for a value that has to be typed rather than picked.
@@ -3561,7 +3770,7 @@ def ask_text_input(user_id, field, prompt_key, back_to="main"):
 	debug(f"Running command: ask_text_input({field}) for user {user_id}")
 	markup = InlineKeyboardMarkup(row_width=1)
 	markup.add(InlineKeyboardButton(get_text("button_cancel"), callback_data="cancelTextInput"))
-	sent = send_message(message=get_text(prompt_key), reply_markup=markup)
+	sent = send_message(message=typed_prompt(prompt_key), reply_markup=markup)
 	if sent:
 		save_text_input_state(user_id, field, sent.message_id, back_to)
 
@@ -3596,13 +3805,18 @@ def apply_settings_text_value(field, raw):
 
 	if field == "host_add":
 		alias_name, url = parse_host_definition(raw)
+		# Each refusal is logged as well as answered: the answer goes to the
+		# chat, and a /logfile sent to ask for help used to show nothing at all
+		# about a host that would not add.
 		if not url:
+			debug(f"Rejected host definition [{raw}]: no URL in it")
 			send_message(message=get_text("settings_host_invalid"))
 			return None
 		try:
 			entry = host_registry.add_host(alias_name, url)
 		except host_registry.HostRejected as e:
 			# Nothing was tried: it is what was typed that cannot be registered.
+			debug(f"Rejected host {url}: {e.reason}")
 			key = ("settings_host_duplicate" if e.reason == "duplicate"
 				   else "settings_host_bad_scheme")
 			send_message(message=get_text(key, html.escape(url)))
@@ -3610,6 +3824,7 @@ def apply_settings_text_value(field, raw):
 		except host_registry.HostUnavailable as e:
 			# Rejected at the point of adding, while the connection details are
 			# still in front of the person typing them.
+			debug(f"Could not add host {url}: {e.reason}")
 			send_message(message=get_text("settings_host_unreachable", html.escape(url), html.escape(str(e.reason))))
 			return None
 		return get_text("settings_host_added", html.escape(entry["alias"]))
@@ -5463,7 +5678,7 @@ def confirm_delete(containerId, containerName):
 def ask_command(userId, containerId, containerName):
 	debug(f"Running command: ask_command for container {containerName}")
 	markup = create_simple_keyboard("button_cancel", "cancelAskCommand")
-	x = send_message(message=f'{host_label(ref_host(containerId))}{get_text("prompt_enter_command", containerName)}',
+	x = send_message(message=f'{host_label(ref_host(containerId))}{typed_prompt("prompt_enter_command", containerName)}',
 					reply_markup=markup)
 	if x:
 		save_command_request_state(userId, containerId, containerName, x.message_id)
@@ -7328,7 +7543,7 @@ def get_update_emoji(containerName, host_id=None):
 		if read_container_update_status(image_with_tag, container.name, host_id) is True:
 			status = "⬆️"
 	except Exception as e:
-		error(f"Could not check update: [{e}]")
+		error(f"Could not read the update status of {containerName} on {host_registry.alias(host_id)}: [{e}]")
 
 	return status
 
@@ -7490,7 +7705,7 @@ def ask_port_to_check(userId, host_id=None):
 	debug(f"Running command: ask_port_to_check for user {userId} on {host_id}")
 	markup = InlineKeyboardMarkup(row_width=1)
 	markup.add(InlineKeyboardButton(get_text("button_cancel"), callback_data="cancelCheckPort"))
-	x = send_message(message=f'{host_label(host_id)}{get_text("ports_ask_port")}', reply_markup=markup)
+	x = send_message(message=f'{host_label(host_id)}{typed_prompt("ports_ask_port")}', reply_markup=markup)
 	if x:
 		save_port_check_request_state(userId, x.message_id, host_id)
 

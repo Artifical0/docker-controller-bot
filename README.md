@@ -51,6 +51,7 @@ services:
             - TZ=Europe/Madrid
             #- TELEGRAM_GROUP=
             #- TELEGRAM_THREAD=1
+            #- TELEMETRY=false # Descomenta para desactivar las estadísticas anónimas
         volumes:
             - /var/run/docker.sock:/var/run/docker.sock # NO CAMBIAR
             - /ruta/para/guardar/la/configuracion:/app/config # CAMBIAR LA PARTE IZQUIERDA
@@ -70,6 +71,9 @@ Abre Telegram, busca tu bot y envíale `/start`. Verás el menú principal con b
 
 > [!WARNING]
 > Es obligatorio mapear un volumen en `/app/config`: ahí se guardan los ajustes, las programaciones y la caché de actualizaciones. Sin ese volumen lo pierdes todo al recrear el contenedor.
+
+> [!NOTE]
+> El bot envía una vez al día unas [estadísticas anónimas](#-estadísticas-anónimas) de uso. Son opcionales: descomenta `TELEMETRY=false` en el compose, o desactívalas desde `/settings` → *Estadísticas anónimas* en los 10 minutos que el bot espera antes del primer envío.
 
 <details>
 <summary>🔄 ¿Vienes de la 4.x? No tienes que cambiar nada</summary>
@@ -212,7 +216,7 @@ Todo lo demás se configura desde el propio bot y se guarda en `settings.json`, 
 |Contenedores parados| Si comprueba también las actualizaciones de los contenedores detenidos. Por defecto activado |
 |Canal de notificaciones| Canal donde se publicarán exclusivamente los cambios de estado de los contenedores (arranque, parada, creación y actualizaciones automáticas). La gestión se sigue haciendo desde el chat privado con el bot o desde TELEGRAM_GROUP. El bot comprueba que puede publicar ahí antes de guardarlo |
 |Hosts de Docker| Las máquinas que gestiona el bot. Se añaden, se prueban, se renombran y se quitan desde aquí. Ver desplegable de hosts remotos |
-|Estadísticas anónimas| Una vez al día envía cifras anónimas de uso. Por defecto activado. Ver desplegable de estadísticas |
+|Estadísticas anónimas| Una vez al día envía cifras anónimas de uso. Por defecto activado. Ver [Estadísticas anónimas](#-estadísticas-anónimas) |
 
 Los cambios hechos desde `/settings` se aplican al momento, sin reiniciar el contenedor.
 
@@ -460,18 +464,27 @@ Ver ejemplo completo en la FAQ: *«He visto que se pueden añadir labels…»*.
 
 </details>
 
-<details>
-<summary>📊 Estadísticas anónimas</summary>
+## 📊 Estadísticas anónimas
 
 Desde la 5.0.0 el bot envía una vez al día unas cifras anónimas para saber cuánta gente lo usa, en cuántos hosts y qué funciones se usan más. Así sé dónde poner el esfuerzo. Las estadísticas son públicas: [stats.dgongut.com/docker-controller-bot](https://stats.dgongut.com/docker-controller-bot).
 
-**Qué se envía:** cuántos hosts y contenedores hay (los contenedores, por tramos), qué ajustes están activados, la versión del bot y de Docker, la arquitectura, y cuántas veces al día se ha usado cada comando y cada botón. La lista completa, campo a campo, está en [la página de privacidad](https://stats.dgongut.com/docker-controller-bot/privacy). El servidor descarta cualquier dato que no esté en ella.
+**Son opcionales.** Vienen activadas por defecto y se desactivan de dos formas:
+
+- Desde el bot: `/settings` → *Estadísticas anónimas*. Al desactivarlas se borra también el identificador de la instalación.
+- Desde el compose: `TELEMETRY=false`.
+
+Nada se envía hasta que el bot lleva al menos 10 minutos en marcha, así que da tiempo de sobra a desactivarlas desde `/settings` antes del primer envío.
+
+<details>
+<summary>Qué se envía y qué no</summary>
+
+**Qué se envía:** cuántos hosts y contenedores hay (los contenedores, por tramos), qué ajustes están activados, la versión del bot y de Docker, la arquitectura, y cuántas veces al día se ha usado cada comando y cada botón. En `/settings` → *Estadísticas anónimas* → *Qué se envía* puedes ver el envío exacto que saldría ahora mismo. La lista completa, campo a campo, está en [la página de privacidad](https://stats.dgongut.com/docker-controller-bot/privacy). El servidor descarta cualquier dato que no esté en ella.
 
 **Qué no se envía nunca:** nombres de contenedores, imágenes, hosts o proyectos, direcciones, IDs de Telegram, rutas ni nada de lo que escribes. Tu IP no se guarda.
 
-**Cómo se desactiva:** desde `/settings` → *Estadísticas anónimas*. Al desactivarlas se borra también el identificador de la instalación.
+**El código es abierto:** el [cliente que envía los datos](https://github.com/dgongut/telemetry/tree/main/clients/python) y el [servidor que los recibe](https://github.com/dgongut/telemetry).
 
-Están activadas por defecto. Nada se envía hasta que el bot lleva al menos 10 minutos en marcha. Tampoco se envía si la configuración no está en un volumen, porque sin él cada vez que se recreara el contenedor contaría como una instalación nueva.
+Tampoco se envía nada si la configuración no está en un volumen, porque sin él cada vez que se recreara el contenedor contaría como una instalación nueva.
 
 </details>
 
@@ -491,39 +504,21 @@ Están activadas por defecto. Nada se envía hasta que el bot lleva al menos 10 
 > Pulsa cada pregunta para ver la respuesta.
 
 <details>
-<summary>🧭 ¿Puede el programa decirme de qué versión a qué versión se actualizó una imagen?</summary>
+<summary>🧭 ¿Puede el bot decirme de qué versión a qué versión se actualiza una imagen?</summary>
 
-**Respuesta corta:** No, eso no es posible de forma automática.
+**Sí, siempre que la imagen lo diga.** El aviso de actualización, la lista de `/updateall`, la comparativa antes de confirmar y el resumen final muestran el salto de versión, por ejemplo `1.43.3 → 1.43.4`. `/info` también enseña la versión de cada contenedor y la actualización pendiente.
 
-**Respuesta explicada:**
+**De dónde la saca.** No del tag, porque `latest` puede apuntar a cualquier cosa, sino de la propia imagen y sin peticiones extra:
 
-El programa no se basa en "versiones", sino en comprobar si una imagen Docker ha cambiado.  
-Esto se hace comparando el **hash (identificador único)** de la imagen local con el hash remoto.
+- La etiqueta estándar `org.opencontainers.image.version` (o la antigua `org.label-schema.version`), que llevan la mayoría de imágenes modernas, como las de linuxserver.
+- En las imágenes oficiales de Docker (nginx, postgres, redis…), que no llevan esa etiqueta, su variable de entorno con la versión: `NGINX_VERSION`, `PG_VERSION`…
 
-- En Docker, el **tag** (como `latest`, `v1.2`, etc.) es solo una etiqueta.
-- Esa etiqueta **no siempre representa una versión real** del software dentro de la imagen.
-- Algunos desarrolladores usan etiquetas que coinciden con la versión (como `v1.2.3`), pero no es obligatorio ni automático.
-- Por ejemplo, el tag `latest` puede apuntar a una imagen completamente distinta en cualquier momento.
+**Si la imagen no declara su versión**, la actualización se detecta igual, porque el bot compara la imagen local con la del registro, pero no puede ponerle números: verás la fecha y el identificador (digest) de cada imagen.
 
-🔍 Por eso, aunque sepamos que una imagen cambió, **no podemos decir automáticamente "pasaste de la versión X a la Y"**.
+**Además:**
 
-**¿Por qué no se muestra el changelog o la lista de cambios?**
-
-Mostrar un changelog requeriría:
-
-- Saber de qué versión venías y a cuál fuiste (lo cual no es posible automáticamente).
-- Que el desarrollador del contenedor publique esa información en un lugar conocido (como GitHub o Docker Hub).
-- Que haya una forma estándar de obtenerlo, cosa que no siempre ocurre.
-
-📦 Cada contenedor es diferente, y no todos publican cambios de forma clara o accesible.
-
-**Entonces, ¿cómo puedo saber qué cambió?**
-
-Puedes hacerlo manualmente:
-
-1. El programa puede mostrarte el **hash anterior** y el **nuevo hash** de la imagen.
-2. Con esos datos, puedes ir al repositorio del contenedor (GitHub, Docker Hub, etc.).
-3. Busca allí el historial de versiones, el changelog o las notas de lanzamiento si están disponibles.
+- Si sube el primer número (`1.x → 2.0`), la comparativa avisa de que puede traer cambios incompatibles. Las versiones con fecha, como `2026.10.1`, no cuentan como salto mayor.
+- Si la imagen indica su repositorio de GitHub (etiqueta `org.opencontainers.image.source`), la comparativa enlaza a las novedades de esa versión, o a la lista de versiones si no encuentra su página.
 
 </details>
 

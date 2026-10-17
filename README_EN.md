@@ -51,6 +51,7 @@ services:
             - TZ=Europe/Madrid
             #- TELEGRAM_GROUP=
             #- TELEGRAM_THREAD=1
+            #- TELEMETRY=false # Uncomment to turn anonymous statistics off
         volumes:
             - /var/run/docker.sock:/var/run/docker.sock # DON'T CHANGE
             - /path/to/save/the/config:/app/config # CHANGE THE LEFT PATH
@@ -70,6 +71,9 @@ Open Telegram, find your bot and send it `/start`. You will see the button-based
 
 > [!WARNING]
 > Mapping a volume to `/app/config` is required: settings, schedules and the update cache live there. Without it you lose everything when the container is recreated.
+
+> [!NOTE]
+> Once a day the bot sends some [anonymous usage statistics](#-anonymous-statistics). They are optional: uncomment `TELEMETRY=false` in the compose file, or turn them off from `/settings` → *Anonymous statistics* during the 10 minutes the bot waits before the first report.
 
 <details>
 <summary>🔄 Coming from 4.x? You don't need to change anything</summary>
@@ -212,7 +216,7 @@ Everything else is configured from the bot itself and stored in `settings.json`,
 |Stopped containers| Whether stopped containers are checked for updates too. Enabled by default |
 |Notification channel| Channel where container status changes are exclusively published (start, stop, creation and automatic updates). Management still happens in the private chat with the bot or in TELEGRAM_GROUP. The bot verifies it can post there before saving it |
 |Docker hosts| The machines the bot manages. Added, tested, renamed and removed from here. See the remote hosts dropdown |
-|Anonymous statistics| Once a day it sends anonymous usage figures. Enabled by default. See the statistics dropdown |
+|Anonymous statistics| Once a day it sends anonymous usage figures. Enabled by default. See [Anonymous statistics](#-anonymous-statistics) |
 
 Changes made from `/settings` apply immediately, without restarting the container.
 
@@ -460,18 +464,27 @@ See the full example in the FAQ: *"I've seen that you can add labels…"*.
 
 </details>
 
-<details>
-<summary>📊 Anonymous statistics</summary>
+## 📊 Anonymous statistics
 
 Since 5.0.0 the bot sends a few anonymous figures once a day, to know how many people use it, on how many hosts and which features are used most. That way I know where to put the effort. The statistics are public: [stats.dgongut.com/docker-controller-bot](https://stats.dgongut.com/docker-controller-bot).
 
-**What is sent:** how many hosts and containers there are (containers in ranges), which settings are on, the bot and Docker versions, the architecture, and how many times a day each command and button was used. The complete list, field by field, is on [the privacy page](https://stats.dgongut.com/docker-controller-bot/privacy). The server discards anything that is not on it.
+**They are optional.** They are on by default and there are two ways to turn them off:
+
+- From the bot: `/settings` → *Anonymous statistics*. Turning them off also deletes the installation's identifier.
+- From the compose file: `TELEMETRY=false`.
+
+Nothing is sent until the bot has been running for at least 10 minutes, so there is plenty of time to turn them off from `/settings` before the first report.
+
+<details>
+<summary>What is sent and what is not</summary>
+
+**What is sent:** how many hosts and containers there are (containers in ranges), which settings are on, the bot and Docker versions, the architecture, and how many times a day each command and button was used. In `/settings` → *Anonymous statistics* → *What is sent* you can see the exact report that would go out right now. The complete list, field by field, is on [the privacy page](https://stats.dgongut.com/docker-controller-bot/privacy). The server discards anything that is not on it.
 
 **What is never sent:** container, image, host or project names, addresses, Telegram IDs, paths or anything you type. Your IP is not stored.
 
-**How to turn it off:** from `/settings` → *Anonymous statistics*. Turning them off also deletes the installation's identifier.
+**The code is open:** the [client that sends the data](https://github.com/dgongut/telemetry/tree/main/clients/python) and the [server that receives it](https://github.com/dgongut/telemetry).
 
-They are on by default. Nothing is sent until the bot has been running for at least 10 minutes. Nor is anything sent when the configuration is not on a volume, because without one every time the container was recreated it would count as a new installation.
+Nor is anything sent when the configuration is not on a volume, because without one every time the container was recreated it would count as a new installation.
 
 </details>
 
@@ -491,39 +504,21 @@ They are on by default. Nothing is sent until the bot has been running for at le
 > Click each question to see the answer.
 
 <details>
-<summary>🧭 Can the bot tell me from which version to which version an image was updated?</summary>
+<summary>🧭 Can the bot tell me from which version to which version an image is updated?</summary>
 
-**Short answer:** No, that's not possible automatically.
+**Yes, as long as the image says so.** The update notice, the `/updateall` list, the comparison before confirming and the final summary show the version step, for example `1.43.3 → 1.43.4`. `/info` also shows each container's version and its pending update.
 
-**Detailed explanation:**
+**Where it comes from.** Not from the tag, since `latest` can point to anything, but from the image itself, with no extra requests:
 
-The bot doesn't rely on "versions", but rather checks whether a Docker image has changed.
-This is done by comparing the **hash (unique identifier)** of the local image with the remote hash.
+- The standard `org.opencontainers.image.version` label (or the older `org.label-schema.version`), which most modern images carry, such as linuxserver's.
+- For Docker's official images (nginx, postgres, redis…), which don't carry that label, their version environment variable: `NGINX_VERSION`, `PG_VERSION`…
 
-- In Docker, the **tag** (like latest, v1.2, etc.) is just a label.
-- That label **doesn't always represent a real version** of the software inside the image.
-- Some developers use tags that match the version (like v1.2.3), but that's neither required nor automatic.
-- For example, the tag `latest` can point to a completely different image at any time.
+**If the image doesn't declare its version**, the update is still detected, because the bot compares the local image with the registry's, but it can't put numbers on it: you'll see each image's date and identifier (digest).
 
-🔍 That's why, even if we know an image has changed, **we can't automatically say "you went from version X to version Y."**
+**Also:**
 
-**Why isn’t the changelog or list of changes shown?**
-
-Showing a changelog would require:
-
-- Knowing which version you had and which one you updated to (which isn't possible automatically).
-- The container's developer to publish that information somewhere accessible (like GitHub or Docker Hub).
-- A standardized way to retrieve it — which doesn't always exist.
-
-📦 Each container is different, and not all of them publish clear or accessible change logs.
-
-**So, how can I find out what changed?**
-
-You can do it manually:
-
-1. The bot can show you the **previous hash** and the **new hash** of the image.
-2. With that information, you can visit the container's repository (GitHub, Docker Hub, etc.).
-3. Look for version history, changelogs, or release notes if they're available there.
+- If the first number goes up (`1.x → 2.0`), the comparison warns that it may bring breaking changes. Date-based versions, such as `2026.10.1`, don't count as a major jump.
+- If the image names its GitHub repository (the `org.opencontainers.image.source` label), the comparison links to that version's release notes, or to the list of releases if it can't find its page.
 
 </details>
 
